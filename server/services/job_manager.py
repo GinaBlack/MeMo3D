@@ -1,43 +1,37 @@
 """
 Job Manager
 ===========
-In-memory async job store + background worker.
-Supports both the two-step (upload-metadata / start-processing) flow
-and the single-shot /upload flow.
+Lightweight in-memory job store + async background worker.
+For production, swap the dict for Redis / a database.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import shutil
-import tempfile
 import time
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
-from core.config import settings
-from models.schemas import (
+from app.core.config import settings
+from app.models.schemas import (
     DicomMetadata,
     JobStatus,
     JobStatusResponse,
     SegmentationConfig,
     SegmentationResult,
-    TissueType,
 )
-from services.dicom_loader import extract_dicom_from_zip, discover_dicom_files, load_dicom_series
-from services.file_utils import save_segmentation_results
-from services.reconstruction import reconstruct_3d
-from services.segmentation import run_ai_inference, segment_volume
+from app.services.dicom_loader import discover_dicom_files, load_dicom_series
+from app.services.reconstruction import reconstruct_3d
+from app.services.segmentation import segment_volume
 
 logger = logging.getLogger(__name__)
 
-# ── In-memory stores ──────────────────────────────────────────────────────────
+# ── in-memory store ───────────────────────────────────────────────────────────
 _jobs: Dict[str, JobStatusResponse] = {}
-_temp_files: Dict[str, Dict[str, Any]] = {}   # file_id → {path, anonymize}
 _semaphore: Optional[asyncio.Semaphore] = None
 
 
@@ -48,7 +42,7 @@ def _get_semaphore() -> asyncio.Semaphore:
     return _semaphore
 
 
-# ── CRUD helpers ──────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def create_job() -> str:
     job_id = str(uuid.uuid4())
@@ -65,20 +59,6 @@ def get_job(job_id: str) -> Optional[JobStatusResponse]:
     return _jobs.get(job_id)
 
 
-def list_jobs() -> Dict[str, JobStatusResponse]:
-    return dict(_jobs)
-
-
-def delete_job(job_id: str) -> bool:
-    if job_id not in _jobs:
-        return False
-    for base in (settings.OUTPUT_DIR / job_id, settings.UPLOAD_DIR / job_id):
-        if base.exists():
-            shutil.rmtree(base, ignore_errors=True)
-    del _jobs[job_id]
-    return True
-
-
 def _update(
     job_id: str,
     *,
@@ -88,7 +68,7 @@ def _update(
     result: Optional[SegmentationResult] = None,
 ) -> None:
     job = _jobs.get(job_id)
-    if not job:
+    if job is None:
         return
     if status   is not None: job.status   = status
     if progress is not None: job.progress = progress
@@ -96,92 +76,77 @@ def _update(
     if result   is not None: job.result   = result
 
 
-# ── Two-step helpers (upload-metadata / start-processing) ─────────────────────
-
-def store_temp_file(zip_bytes: bytes, anonymize: bool) -> tuple[str, DicomMetadata, list]:
-    """
-    Save ZIP to a temp file, extract volume + metadata, return (file_id, metadata, volume_shape).
-    Called from the /upload-metadata endpoint.
-    """
-    file_id  = str(uuid.uuid4())
-    tmp_path = Path(tempfile.gettempdir()) / f"{file_id}.zip"
-    tmp_path.write_bytes(zip_bytes)
-
-    volume, metadata = extract_dicom_from_zip(zip_bytes, anonymize=anonymize)
-    _temp_files[file_id] = {"path": str(tmp_path), "anonymize": anonymize}
-
-    logger.info("[temp:%s] ZIP cached – %d slices, shape %s", file_id, volume.shape[0], volume.shape)
-    return file_id, metadata, list(volume.shape)
-
-
-def pop_temp_file(file_id: str) -> Optional[Dict[str, Any]]:
-    return _temp_files.pop(file_id, None)
-
-
-# ── Core pipeline (blocking – runs in executor thread) ────────────────────────
+# ── core pipeline (runs in executor / thread) ──────────────────────────────
 
 def _run_pipeline_sync(
     job_id: str,
-    zip_bytes: bytes,
+    zip_path: Path,
     config: SegmentationConfig,
 ) -> None:
+    """Blocking pipeline – DICOM load → segmentation → 3-D reconstruction."""
     t0 = time.perf_counter()
+    work_dir = settings.UPLOAD_DIR / job_id
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # 1. Load volume from ZIP bytes
-        _update(job_id, status=JobStatus.processing, progress=10, message="Loading DICOM slices …")
-        volume, metadata = extract_dicom_from_zip(zip_bytes, anonymize=config.anonymize)
-        logger.info("[%s] Volume loaded: %s", job_id, volume.shape)
+        # ── 1 Unzip ──────────────────────────────────────────────────────────
+        _update(job_id, status=JobStatus.processing, progress=5, message="Extracting ZIP …")
+        extract_dir = work_dir / "dicom"
+        extract_dir.mkdir(exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_dir)
+        logger.info("[%s] ZIP extracted to %s", job_id, extract_dir)
 
-        # 2. Segment
-        _update(job_id, progress=30, message="Segmenting tissue …")
-        if config.use_ai:
-            _update(job_id, message="Running AI inference …")
-            mask, seg_stats = run_ai_inference(volume)
-        else:
-            mask, seg_stats = segment_volume(volume, config)
+        # ── 2 Discover DICOM files ────────────────────────────────────────────
+        _update(job_id, progress=10, message="Discovering DICOM files …")
+        dicom_files = discover_dicom_files(extract_dir)
+        if not dicom_files:
+            raise ValueError("No valid DICOM files found in the uploaded ZIP.")
 
-        # Apply mask to volume for reconstruction
-        masked_volume = np.where(mask, volume, float(volume.min()))
+        # ── 3 Load series ─────────────────────────────────────────────────────
+        _update(job_id, progress=20, message=f"Loading {len(dicom_files)} DICOM slices …")
+        volume, metadata = load_dicom_series(dicom_files)
 
-        # 3. Save NIfTI / NPY outputs
-        _update(job_id, progress=55, message="Saving segmentation files …")
-        meta_dict = metadata.model_dump() if hasattr(metadata, "model_dump") else metadata.__dict__
-        saved = save_segmentation_results(
-            mask.astype(np.uint8), np.zeros_like(volume, dtype=np.float32),
-            meta_dict, volume.shape, job_id,
-        )
+        # ── 4 Segment ────────────────────────────────────────────────────────
+        _update(job_id, progress=40, message="Segmenting tissue …")
+        mask, seg_stats = segment_volume(volume, config)
 
-        # 4. 3-D reconstruction
-        _update(job_id, progress=65, message="Running 3D reconstruction …")
+        # Apply mask – zero out voxels outside the segment, keep HU elsewhere
+        masked_volume = np.where(mask, volume, volume.min())
+
+        # ── 5 Reconstruct 3-D mesh ───────────────────────────────────────────
+        _update(job_id, progress=60, message="Running Marching Cubes …")
         mesh_path, preview_path, mesh_stats = reconstruct_3d(
-            masked_volume, config, job_id,
+            masked_volume,
+            config,
+            job_id,
             pixel_spacing=metadata.pixel_spacing,
             slice_thickness=metadata.slice_thickness,
         )
-                
 
-        # 5. Done
+        # ── 6 Build result ────────────────────────────────────────────────────
+        _update(job_id, progress=95, message="Finalising …")
         elapsed = time.perf_counter() - t0
+
+        result = SegmentationResult(
+            job_id=job_id,
+            status=JobStatus.completed,
+            tissue_type=config.tissue_type,
+            mesh_file=f"/api/v1/jobs/{job_id}/download/mesh",
+            preview_file=f"/api/v1/jobs/{job_id}/download/preview"
+            if preview_path and preview_path.exists()
+            else None,
+            metadata=metadata,
+            statistics={**seg_stats, **mesh_stats},
+            processing_time_s=round(elapsed, 2),
+        )
+
         _update(
             job_id,
             status=JobStatus.completed,
             progress=100,
             message="Completed successfully.",
-            result=SegmentationResult(
-                job_id=job_id,
-                status=JobStatus.completed,
-                tissue_type=config.tissue_type,
-                mesh_file=f"/api/v1/jobs/{job_id}/download/mesh",
-                nifti_file=f"/api/v1/jobs/{job_id}/download/nifti",
-                preview_file=(
-                    f"/api/v1/jobs/{job_id}/download/preview"
-                    if preview_path and preview_path.exists() else None
-                ),
-                metadata=metadata,
-                statistics={**seg_stats, **mesh_stats},
-                processing_time_s=round(elapsed, 2),
-            ),
+            result=result,
         )
         logger.info("[%s] Pipeline done in %.2f s", job_id, elapsed)
 
@@ -199,47 +164,35 @@ def _run_pipeline_sync(
                 error=str(exc),
             ),
         )
+    finally:
+        # Clean up raw upload to save disk space
+        try:
+            shutil.rmtree(work_dir / "dicom", ignore_errors=True)
+            zip_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-import numpy as np   # noqa: E402  (needed by _run_pipeline_sync above)
+# Lazy import to avoid circular at module level
+import numpy as np  # noqa: E402  (imported here for _run_pipeline_sync)
 
 
-# ── Async entry points ────────────────────────────────────────────────────────
+# ── async entry point ─────────────────────────────────────────────────────────
 
 async def submit_job(
     job_id: str,
-    zip_bytes: bytes,
+    zip_path: Path,
     config: SegmentationConfig,
 ) -> None:
-    """Submit a single-shot job (ZIP bytes passed directly)."""
-    sem  = _get_semaphore()
+    """Submit a reconstruction job to the background executor."""
+    sem = _get_semaphore()
     loop = asyncio.get_event_loop()
 
     async def _worker():
         async with sem:
             await loop.run_in_executor(
-                None, _run_pipeline_sync, job_id, zip_bytes, config
+                None, _run_pipeline_sync, job_id, zip_path, config
             )
 
     asyncio.create_task(_worker())
-    logger.info("[%s] Job submitted", job_id)
-
-
-async def submit_job_from_file(
-    job_id: str,
-    file_id: str,
-    config: SegmentationConfig,
-) -> None:
-    """Submit a job from a previously cached temp file (two-step flow)."""
-    file_info = pop_temp_file(file_id)
-    if not file_info:
-        raise ValueError(f"No temp file found for file_id={file_id}")
-
-    zip_path = Path(file_info["path"])
-    zip_bytes = zip_path.read_bytes()
-    try:
-        zip_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    await submit_job(job_id, zip_bytes, config)
+    logger.info("[%s] Job submitted.", job_id)

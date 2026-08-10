@@ -1,0 +1,32 @@
+from utils.helpers import safe_str, safe_float_list
+
+def extract_metadata_from_dicom(ds):
+    return {
+        "patient_name": safe_str(ds.get('PatientName')),
+        "patient_id": safe_str(ds.get('PatientID')),
+        "patient_birth_date": safe_str(ds.get('PatientBirthDate')),
+        "patient_sex": safe_str(ds.get('PatientSex')),
+        "patient_age": safe_str(ds.get('PatientAge')),
+        "study_date": safe_str(ds.get('StudyDate')),
+        "study_time": safe_str(ds.get('StudyTime')),
+        "study_id": safe_str(ds.get('StudyID')),
+        "accession_number": safe_str(ds.get('AccessionNumber')),
+        "study_description": safe_str(ds.get('StudyDescription')),
+        "modality": safe_str(ds.get('Modality')),
+        "series_number": safe_str(ds.get('SeriesNumber')),
+        "series_description": safe_str(ds.get('SeriesDescription')),
+        "manufacturer": safe_str(ds.get('Manufacturer')),
+        "institution_name": safe_str(ds.get('InstitutionName')),
+        "slice_thickness": float(ds.get('SliceThickness', 1.0)),
+        "pixel_spacing": safe_float_list(ds.get('PixelSpacing')),
+        "rows": int(ds.get('Rows', 512)),
+        "columns": int(ds.get('Columns', 512)),
+        "kvp": safe_str(ds.get('KVP')),
+        "exposure": safe_str(ds.get('Exposure')),
+        "window_center": safe_str(ds.get('WindowCenter')),
+        "window_width": safe_str(ds.get('WindowWidth')),
+        "body_part": safe_str(ds.get('BodyPartExamined')),
+        "patient_position": safe_str(ds.get('PatientPosition')),
+        "protocol_name": safe_str(ds.get('ProtocolName')),
+        "contrast_agent": safe_str(ds.get('ContrastBolusAgent')),
+    }
